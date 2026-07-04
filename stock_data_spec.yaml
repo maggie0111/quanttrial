@@ -1,0 +1,260 @@
+# ============================================================
+# Stock Data Fetch Specification (股票数据获取规范)
+# Version: 1.0
+# Created: 2026-07-04
+# Description: 标准化 A股/H股 复权数据获取流程，确保数据一致性与可复用性
+# ============================================================
+
+# -------------------- 1. 全局设置 --------------------
+settings:
+  date_format: "YYYYMMDD"           # 统一日期格式
+  timezone: "Asia/Shanghai"
+  adjustment: "qfq"                # 复权方式: qfq=前复权, hfq=后复权, none=不复权
+  period:                           # 数据时间范围
+    start: "20250701"
+    end: "20260704"
+  currency:
+    a_share: "CNY"                 # A股计价货币
+    h_share: "HKD"                 # H股计价货币
+  exchange_rate:                    # A/H对比时使用的汇率
+    hkdcny: 0.86784                # 1 HKD = 0.86784 CNY (央行中间价 2026-07-01)
+    rate_date: "2026-07-01"
+
+# -------------------- 2. 股票池 --------------------
+stocks:
+  - name: "贵州茅台"
+    short_name: "Moutai"
+    sector: "白酒"
+    a_share:
+      ts_code: "600519.SH"         # Tushare 代码
+      exchange: "SSE"              # 上海证券交易所
+    h_share: null                  # 茅台无H股上市
+
+  - name: "宁德时代"
+    short_name: "CATL"
+    sector: "动力电池"
+    a_share:
+      ts_code: "300750.SZ"         # Tushare 代码
+      exchange: "SZSE"             # 深圳证券交易所
+    h_share:
+      ticker: "3750.HK"            # yfinance ticker
+      ts_code: "03750.HK"          # Tushare 港股代码 (备用)
+      exchange: "HKEX"             # 中国香港交易所
+
+# -------------------- 3. 数据源配置 --------------------
+sources:
+  # A股日线行情 (原始未复权)
+  a_share_daily:
+    type: "tushare_mcp"
+    interface: "mcp__tushareMcp__daily"
+    required_params:
+      ts_code: "{ts_code}"
+      start_date: "{period.start}"
+      end_date: "{period.end}"
+    default_fields:
+      - ts_code
+      - trade_date
+      - open
+      - high
+      - low
+      - close
+      - pre_close
+      - change
+      - pct_chg
+      - vol
+      - amount
+    notes: "返回原始未复权数据，需配合 adj_factor 计算复权价"
+
+  # A股复权因子
+  a_share_adj_factor:
+    type: "tushare_mcp"
+    interface: "mcp__tushareMcp__adj_factor"
+    required_params:
+      ts_code: "{ts_code}"
+      start_date: "{period.start}"
+      end_date: "{period.end}"
+    default_fields:
+      - ts_code
+      - trade_date
+      - adj_factor
+    notes: "复权因子，用于计算前/后复权价格"
+
+  # H股日线行情 (yfinance, 自动前复权)
+  h_share_daily:
+    type: "python_yfinance"
+    library: "yfinance"
+    required_params:
+      ticker: "{ticker}"
+      start: "{period.start_iso}"   # ISO 格式: 2025-07-01
+      end: "{period.end_iso}"       # ISO 格式: 2026-07-05
+      auto_adjust: true             # 自动前复权
+    fields_mapping:
+      Date: trade_date
+      Open: open
+      High: high
+      Low: low
+      Close: close
+      Volume: vol
+    notes: "auto_adjust=true 时 Close 即为前复权收盘价；成交量单位为股"
+
+  # H股日线行情 (Tushare, 备用方案, 1次/小时限制)
+  h_share_daily_tushare:
+    type: "tushare_mcp"
+    interface: "mcp__tushareMcp__hk_daily"
+    required_params:
+      ts_code: "{ts_code}"
+      start_date: "{period.start}"
+      end_date: "{period.end}"
+    default_fields:
+      - ts_code
+      - trade_date
+      - open
+      - high
+      - low
+      - close
+      - pre_close
+      - change
+      - pct_chg
+      - vol
+      - amount
+    rate_limit: "1次/小时"
+    notes: "有频率限制，仅在 yfinance 不可用时作为备用"
+
+# -------------------- 4. 复权计算公式 --------------------
+adjustment_formulas:
+  # 前复权 (qfq): 将历史价格调整到最新价格水平
+  # 效果：最新交易日价格不变，历史价格按比例下调
+  qfq:
+    description: "前复权 - 价格调整至最新水平"
+    formula: "adj_price = raw_price * adj_factor / max(adj_factor)"
+    formula_fields: "adj_open = open * adj_factor / latest_factor"
+    latest_factor: "取该时间段内 adj_factor 的最大值（即最新交易日的因子）"
+    use_case: "适合趋势分析、技术指标计算，价格直观可比"
+
+  # 后复权 (hfq): 将当前价格调整到历史基准
+  # 效果：最早交易日价格不变，后续价格按比例上调
+  hfq:
+    description: "后复权 - 价格调整至最早水平"
+    formula: "adj_price = raw_price * adj_factor"
+    use_case: "适合计算长期收益率、回测策略"
+
+  # yfinance 自动复权
+  yfinance_auto:
+    description: "yfinance auto_adjust=true 直接返回前复权数据"
+    notes: "Open/High/Low/Close 均已前复权，无需额外计算"
+
+# -------------------- 5. 统一输出字段定义 --------------------
+output_schema:
+  # 复权后的标准输出列 (CSV)
+  columns:
+    - name: trade_date
+      dtype: string
+      format: "YYYYMMDD"
+      description: "交易日期"
+    - name: open
+      dtype: float
+      description: "前复权开盘价"
+    - name: high
+      dtype: float
+      description: "前复权最高价"
+    - name: low
+      dtype: float
+      description: "前复权最低价"
+    - name: close
+      dtype: float
+      description: "前复权收盘价"
+    - name: volume
+      dtype: float
+      description: "成交量 (A股: 手, H股: 股)"
+    - name: amount
+      dtype: float
+      description: "成交额 (仅A股, H股为空)"
+    - name: pct_chg
+      dtype: float
+      description: "涨跌幅(%)"
+    - name: adj_factor
+      dtype: float
+      description: "复权因子 (仅A股, H股为空)"
+
+# -------------------- 6. 文件命名规范 --------------------
+file_naming:
+  # A股: {短名}_{代码}_daily_qfq.csv
+  # H股: {短名}_{代码}HK_daily_qfq.csv
+  pattern_a: "{short_name}_{code}_daily_qfq.csv"
+  pattern_h: "{short_name}_{code}HK_daily_qfq.csv"
+  suffix_meaning:
+    qfq: "前复权"
+    hfq: "后复权"
+    raw: "未复权(原始)"
+  examples:
+    - "Moutai_600519_daily_qfq.csv"
+    - "CATL_300750_daily_qfq.csv"
+    - "CATL_3750HK_daily_qfq.csv"
+
+# -------------------- 7. 数据校验规则 --------------------
+validation:
+  completeness:
+    - "检查每个交易日是否都有数据（排除周末和中国法定节假日）"
+    - "检查是否有缺失值 (NaN/None)"
+    - "检查起止日期是否覆盖预期时间范围"
+  price_logic:
+    - "low <= open <= high 且 low <= close <= high"
+    - "所有价格 > 0"
+    - "成交量 >= 0"
+  adjustment_check:
+    - "前复权后：最新交易日复权收盘价 == 原始收盘价"
+    - "前复权后：复权因子在时间段内单调非递减（分红日有跳变属正常）"
+    - "复权后不应出现负价格"
+  cross_check:
+    - "同一公司A/H股交易日对齐：合并时以两者都有的交易日为准（仅宁德时代）"
+    - "汇率转换：H股价格 * hkdcny_rate 后与A股价格比较（仅宁德时代）"
+    - "茅台仅A股，无需跨市场校验"
+
+# -------------------- 8. 取数流程 (SOP) --------------------
+workflow:
+  step_1:
+    name: "确认股票代码与数据源"
+    actions:
+      - "查阅本 spec 中 stocks 部分，确认 ts_code / ticker"
+      - "确认数据源：A股用 Tushare，H股用 yfinance"
+  step_2:
+    name: "获取A股原始行情数据"
+    actions:
+      - "调用 mcp__tushareMcp__daily，传入 ts_code + 日期范围"
+      - "保存原始数据，字段：trade_date, open, high, low, close, vol, amount"
+  step_3:
+    name: "获取A股复权因子"
+    actions:
+      - "调用 mcp__tushareMcp__adj_factor，传入相同 ts_code + 日期范围"
+      - "按 trade_date 合并到原始行情数据"
+  step_4:
+    name: "计算A股前复权价格"
+    actions:
+      - "计算 latest_factor = max(adj_factor)"
+      - "adj_price = raw_price * adj_factor / latest_factor (对 open/high/low/close)"
+      - "pct_chg 保持不变（涨跌幅不受复权影响）"
+  step_5:
+    name: "获取H股复权数据"
+    actions:
+      - "调用 yfinance.download(ticker, start, end, auto_adjust=True)"
+      - "列名映射：Date->trade_date, Open->open, High->high, Low->low, Close->close, Volume->vol"
+      - "日期格式转换为 YYYYMMDD"
+  step_6:
+    name: "数据校验"
+    actions:
+      - "执行 validation 中所有校验规则"
+      - "记录异常（如缺失交易日、价格异常等）"
+  step_7:
+    name: "输出标准化CSV"
+    actions:
+      - "按 output_schema 格式输出"
+      - "按 file_naming 规范命名"
+      - "保存至项目根目录"
+
+# -------------------- 9. 注意事项 --------------------
+notes:
+  - "Tushare hk_daily 有 1次/小时 限制，H股数据统一用 yfinance"
+  - "yfinance 成交量单位为股，Tushare 成交量单位为手(100股)，合并时需注意"
+  - "A/H溢价计算需统一货币：H股价格(HKD) * 汇率 -> CNY，再与A股价格比较"
+  - "复权方式默认前复权(qfq)，如需后复权改 settings.adjustment 为 hfq 并调整公式"
+  - "节假日列表可参考 Tushare trade_cal 接口"
