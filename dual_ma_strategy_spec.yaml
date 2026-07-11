@@ -1,0 +1,673 @@
+# ============================================================
+# Dual Moving Average Crossover Strategy Specification
+# 双均线交叉策略规范
+# Version: 1.3
+# Created: 2026-07-11
+# Updated: 2026-07-11 — 交易成本改为手续费万三+滑点万一; 买入持有升级为完整回测对比; SMIC改用前复权数据; 新增时间窗口可选项
+# Description: 标准化双均线交叉策略的完整流程，涵盖数据加载、均线计算、
+#              信号生成、可视化、回测评卡、参数实验与策略总结
+# Author: 郭美杰
+# ============================================================
+
+# -------------------- 1. 策略概述 --------------------
+strategy:
+  name: "Dual Moving Average Crossover (双均线交叉)"
+  type: "趋势跟踪 / Trend Following"
+  principle: |
+    利用短期均线与长期均线的交叉关系判断趋势方向：
+    - 金叉 (Golden Cross): 短均线从下方上穿长均线 → 买入信号
+    - 死叉 (Death Cross): 短均线从上方下穿长均线 → 卖出信号
+  core_logic:
+    - "短均线反映近期价格趋势，反应快但噪声多"
+    - "长均线反映中长期趋势，滞后但稳定"
+    - "两者交叉代表趋势方向可能发生反转"
+  applicability: |
+    适用于单边趋势行情（牛市或熊市），在震荡市中容易产生频繁的虚假信号
+    导致反复止损。需配合成交量、波动率等辅助指标过滤假信号。
+
+# -------------------- 2. 股票池与数据文件 --------------------
+stocks:
+  - name: "宁德时代"
+    short_name: "CATL"
+    sector: "动力电池 / 新能源"
+    exchange: "SZSE"
+    ts_code: "300750.SZ"
+    data_file: "CATL_300750_daily_qfq.csv"
+    data_status: "已前复权(qfq)，时间正序，可直接使用"
+    date_range: "20250704 ~ 20260702"
+    trading_days: 242
+    columns:
+      - trade_date
+      - open
+      - high
+      - low
+      - close
+      - volume
+      - amount
+      - pct_chg
+      - adj_factor
+    notes: "数据完整，无需额外清洗"
+
+  - name: "中芯国际"
+    short_name: "SMIC"
+    sector: "半导体 / 集成电路制造"
+    exchange: "SSE (科创板)"
+    ts_code: "688981.SH"
+    data_file: "SMIC_688981_daily_qfq.csv"
+    data_status: "已前复权(qfq)，时间正序，可直接使用"
+    date_range: "20250701 ~ 20260701"
+    trading_days: 237
+    columns:
+      - trade_date
+      - open
+      - high
+      - low
+      - close
+      - volume
+      - amount
+      - pct_chg
+      - adj_factor
+    notes: |
+      由 SMIC_688981_daily.csv (原始未复权) 经 process_smic_qfq.py 处理生成:
+      - 删除 close==0 的行 (20260702 全零行)
+      - 时间倒序转为正序
+      - vol 重命名为 volume
+      - 调用 Tushare adj_factor 获取复权因子 (本期全为1.0, 无分红送股)
+      - 按 qfq 公式计算前复权价格: adj = raw × factor / max(factor)
+      - 输出列与 CATL qfq 文件完全一致
+
+# -------------------- 3. 数据加载与预处理 --------------------
+data_preprocessing:
+  step_1_load:
+    name: "加载CSV数据"
+    actions:
+      - "使用 pandas.read_csv 读取，dtype={'trade_date': str} 保留日期为字符串"
+      - "CATL: 直接加载 CATL_300750_daily_qfq.csv"
+      - "SMIC: 直接加载 SMIC_688981_daily_qfq.csv"
+
+  step_2_clean:
+    name: "数据清洗"
+    actions:
+      - "CATL: 检查无缺失值，直接使用"
+      - "SMIC: 检查无缺失值，直接使用 (原始数据已在 process_smic_qfq.py 中完成清洗和复权)"
+      - "两者: 检查 close > 0, reset_index(drop=True)"
+
+  step_3_validate:
+    name: "数据校验"
+    checks:
+      - "所有 close > 0"
+      - "low <= open <= high 且 low <= close <= high"
+      - "volume >= 0"
+      - "trade_date 无重复值"
+      - "日期连续性检查 (排除周末和节假日后的缺口属正常)"
+
+  step_4_standardize:
+    name: "输出标准化DataFrame"
+    unified_columns:
+      - trade_date: "string, YYYYMMDD"
+      - open: "float"
+      - high: "float"
+      - low: "float"
+      - close: "float, 策略使用收盘价"
+      - volume: "float"
+      - pct_chg: "float, 涨跌幅%"
+    notes: "统一列名后，两支股票可使用相同的策略函数处理"
+
+# -------------------- 4. 均线计算 --------------------
+moving_average:
+  definition: |
+    简单移动平均线 (SMA) = 过去 N 个交易日收盘价的算术平均值
+    SMA_N(t) = (1/N) * Σ close(t-i+1), i=1..N
+
+  default_params:
+    short_period: 5       # 短均线周期
+    long_period: 15       # 长均线周期
+
+  alternative_params:     # 参数实验用
+    - {short: 5,  long: 10}
+    - {short: 5,  long: 15}   # 默认
+    - {short: 5,  long: 20}
+    - {short: 10, long: 20}
+    - {short: 10, long: 30}
+    - {short: 20, long: 60}
+
+  calculation:
+    method: "pandas Series.rolling(window=N).mean()"
+    min_periods: "N (前 N-1 个交易日为 NaN，不产生信号)"
+    output_columns:
+      - MA_short: "短均线值"
+      - MA_long: "长均线值"
+
+  notes:
+    - "使用收盘价计算均线"
+    - "均线起始 N-1 天为 NaN，信号计算时自动跳过"
+    - "如需指数移动平均(EMA)，替换为 close.ewm(span=N).mean()"
+
+# -------------------- 5. 交易信号生成 --------------------
+signals:
+  signal_logic:
+    golden_cross:
+      condition: "MA_short(t) > MA_long(t) AND MA_short(t-1) <= MA_long(t-1)"
+      action: "BUY (买入)"
+      meaning: "短期均线上穿长期均线，趋势转强"
+    death_cross:
+      condition: "MA_short(t) < MA_long(t) AND MA_short(t-1) >= MA_long(t-1)"
+      action: "SELL (卖出)"
+      meaning: "短期均线下穿长期均线，趋势转弱"
+    hold:
+      condition: "无交叉发生"
+      action: "HOLD (持有/空仓)"
+      meaning: "维持当前仓位"
+
+  implementation:
+    method: |
+      # 计算前一日均线关系
+      prev_short = MA_short.shift(1)
+      prev_long = MA_long.shift(1)
+
+      # 金叉条件: 昨日短<=长, 今日短>长
+      golden = (prev_short <= prev_long) & (MA_short > MA_long)
+      # 死叉条件: 昨日短>=长, 今日短<长
+      death = (prev_short >= prev_long) & (MA_short < MA_long)
+
+      signal = 0  # 默认持有
+      signal[golden] = 1   # 买入
+      signal[death] = -1   # 卖出
+
+  output_columns:
+    - signal: "1=买入, -1=卖出, 0=无操作"
+    - position: "当前持仓状态: 1=持仓, 0=空仓 (根据信号累积)"
+
+  position_tracking: |
+    position[0] = 0  # 初始空仓
+    遍历每个交易日:
+      if signal[t] == 1:  position[t] = 1  (买入并持有)
+      if signal[t] == -1: position[t] = 0  (卖出空仓)
+      if signal[t] == 0:  position[t] = position[t-1]  (维持)
+
+  trading_rules:
+    - "信号在当日收盘后确认，次日开盘执行 (或当日收盘价执行)"
+    - "同一时间最多持有一手 (满仓/空仓二选一)"
+    - "不考虑做空，仅在持仓时盈利/亏损"
+    - "每次交易全额买入/卖出 (无仓位管理)"
+
+# -------------------- 6. 可视化要求 --------------------
+visualization:
+  chart_type: "HTML 交互式看板 (ECharts)"
+  color_convention: "A股惯例: 红涨绿跌 (red=up, green=down)"
+  library: "ECharts via CDN"
+  file_naming: "{short_name}_dual_ma_dashboard.html"
+
+  chart_components:
+    main_chart:
+      type: "折线图 (Line Chart)"
+      series:
+        - close: "收盘价折线, 颜色 #333333, 线宽 1.5"
+        - MA_short: "短均线折线, 颜色 #FF6B6B (红), 线宽 1.5"
+        - MA_long: "长均线折线, 颜色 #4ECDC4 (青), 线宽 1.5"
+      x_axis: "trade_date"
+      y_axis: "价格 (元)"
+      title: "{股票名称} 双均线策略 ({short}日/{long}日)"
+
+    signal_markers:
+      buy_markers:
+        type: "标记点 (scatter/markPoint)"
+        condition: "signal == 1"
+        symbol: "triangle (向上箭头)"
+        color: "#FF0000 (红色)"
+        label: "买入"
+        position: "below the price line (y_offset = -10)"
+      sell_markers:
+        type: "标记点 (scatter/markPoint)"
+        condition: "signal == -1"
+        symbol: "triangle (向下箭头)"
+        color: "#00AA00 (绿色)"
+        label: "卖出"
+        position: "above the price line (y_offset = +10)"
+
+    volume_chart:
+      type: "柱状图 (Bar Chart)"
+      color: "红涨绿跌 (根据当日 pct_chg 正负着色)"
+      y_axis: "成交量 (手)"
+
+    backtest_chart:
+      type: "折线图"
+      title: "策略净值 vs 买入持有 (基准对比)"
+      series:
+        - strategy_value: "双均线策略净值曲线, 颜色 #5470C6 (蓝)"
+        - benchmark_value: "买入持有净值曲线, 颜色 #91CC75 (绿), 虚线"
+        - initial_capital: "初始资金基准线, 颜色 #999999, 水平虚线"
+      y_axis: "净值 (元)"
+      annotations:
+        - "策略最终收益率标注"
+        - "买入持有最终收益率标注"
+        - "超额收益标注 (策略 - 基准)"
+
+  layout:
+    - "主图 (价格+均线+信号标记) 占上方 55% 高度"
+    - "成交量图 占中间 20% 高度"
+    - "净值对比图 占下方 25% 高度"
+    - "三图共享 x 轴 (trade_date), 联动 tooltip"
+
+# -------------------- 7. 回测引擎 --------------------
+backtest:
+  assumptions:
+    initial_capital: 100000       # 初始资金 (元)
+    position_size: "full"         # 满仓买入/卖出
+    commission_rate: 0.0003       # 手续费费率 (万三, 双边收取)
+    slippage: 0.0001              # 滑点费率 (万一, 双边)
+    stamp_duty: 0                 # 印花税 (本作业不考虑)
+    trade_price: "close"          # 以当日收盘价成交 (信号当日确认后执行)
+
+  time_window:
+    description: |
+      回测时间窗口 — 从全量历史数据中截取的一段区间用于回测。
+      不同时间窗口对应不同的市场环境（牛市/熊市/震荡），
+      观察策略在不同行情阶段的表现差异。
+    default_mode: "full"          # 默认使用全部数据
+
+    options:
+      - mode: "full"
+        name: "全周期"
+        description: "使用全部可用交易日数据"
+        catl_range: "20250704 ~ 20260702 (242天)"
+        smic_range: "20250701 ~ 20260701 (237天)"
+
+      - mode: "recent_3m"
+        name: "近3个月"
+        description: "截取最近约63个交易日 (一个季度)"
+        catl_range: "约 20260401 ~ 20260702"
+        smic_range: "约 20260401 ~ 20260701"
+
+      - mode: "recent_6m"
+        name: "近6个月"
+        description: "截取最近约126个交易日 (半年)"
+        catl_range: "约 20260101 ~ 20260702"
+        smic_range: "约 20260101 ~ 20260701"
+
+      - mode: "recent_12m"
+        name: "近12个月"
+        description: "截取最近约252个交易日 (一年, 近似全周期)"
+        catl_range: "约 20250704 ~ 20260702"
+        smic_range: "约 20250701 ~ 20260701"
+
+      - mode: "custom"
+        name: "自定义区间"
+        description: "用户指定 start_date 和 end_date (YYYYMMDD)"
+        params:
+          start_date: "YYYYMMDD"
+          end_date: "YYYYMMDD"
+
+    selection_method: |
+      在策略脚本中通过 TIME_WINDOW 参数选择:
+        TIME_WINDOW = "full"          # 全周期 (默认)
+        TIME_WINDOW = "recent_3m"     # 近3个月
+        TIME_WINDOW = "recent_6m"     # 近6个月
+        TIME_WINDOW = "recent_12m"    # 近12个月
+        TIME_WINDOW = {"mode": "custom", "start_date": "20260101", "end_date": "20260401"}
+
+      数据截取逻辑:
+        if mode == "full":
+            df_bt = df  # 全部数据
+        elif mode == "recent_Nm":
+            cutoff = df["trade_date"].iloc[-1] 减去 N*21 个交易日
+            df_bt = df[df["trade_date"] >= cutoff]
+        elif mode == "custom":
+            df_bt = df[(df["trade_date"] >= start_date) & (df["trade_date"] <= end_date)]
+
+      注意: 均线计算使用截取后的数据, 截取区间起始的前 max(long_period)-1 天
+            仍需计入数据以使长均线有效 (实际截取时多取 long_period 天作为预热期)
+
+  cost_model: |
+    交易成本 = 手续费 + 滑点, 双边收取 (买入和卖出各扣一次)
+
+    买入实际成交价 = close[t] × (1 + slippage)
+    买入扣除手续费后单价 = 买入实际成交价 × (1 + commission_rate)
+    → 每股买入成本 = close[t] × (1 + 0.0001) × (1 + 0.0003)
+                  = close[t] × 1.0004  (近似)
+
+    卖出实际成交价 = close[t] × (1 - slippage)
+    卖出扣除手续费后单价 = 卖出实际成交价 × (1 - commission_rate)
+    → 每股卖出收入 = close[t] × (1 - 0.0001) × (1 - 0.0003)
+                   = close[t] × 0.9996  (近似)
+
+    单次完整交易(买入+卖出)成本率 ≈ 0.08% (万八)
+
+  execution_logic: |
+    capital = initial_capital
+    shares = 0
+    position = 0  # 0=空仓, 1=持仓
+    strategy_value = []  # 每日净值序列
+
+    for each trading_day t:
+      if signal[t] == BUY and position == 0:
+        # 买入: 价格上浮滑点, 再扣手续费
+        fill_price = close[t] * (1 + slippage)
+        cost_per_share = fill_price * (1 + commission_rate)
+        shares = capital / cost_per_share
+        capital = 0
+        position = 1
+        record_trade(t, "BUY", close[t], fill_price, shares)
+
+      elif signal[t] == SELL and position == 1:
+        # 卖出: 价格下浮滑点, 再扣手续费
+        fill_price = close[t] * (1 - slippage)
+        revenue_per_share = fill_price * (1 - commission_rate)
+        capital = shares * revenue_per_share
+        shares = 0
+        position = 0
+        record_trade(t, "SELL", close[t], fill_price, capital)
+
+      # 记录当日净值 (持仓时按收盘价估值)
+      daily_value = capital + shares * close[t]
+      strategy_value.append(daily_value)
+
+    final_value = strategy_value[-1]
+
+  benchmark:
+    name: "Buy and Hold (买入持有策略)"
+    description: |
+      作为双均线策略的对比基准。首日全仓买入，持有至末日卖出。
+      同样扣除手续费和滑点，确保对比公平。
+    execution_logic: |
+      # 买入持有: 第一个交易日全仓买入
+      fill_price_buy = close[0] * (1 + slippage)
+      cost_per_share = fill_price_buy * (1 + commission_rate)
+      shares = initial_capital / cost_per_share
+      capital = 0
+      position = 1
+
+      benchmark_value = []
+      for each trading_day t:
+        daily_value = capital + shares * close[t]
+        benchmark_value.append(daily_value)
+
+      # 末日估值 (若实际卖出需扣成本, 此处按收盘价估值以便与策略一致)
+      final_value = benchmark_value[-1]
+
+      # 如需计算卖出后净收益:
+      fill_price_sell = close[-1] * (1 - slippage)
+      revenue_per_share = fill_price_sell * (1 - commission_rate)
+      final_cash = shares * revenue_per_share
+    net_value_curve: |
+      买入持有策略每日净值 = shares × close[t]
+      首日净值 = initial_capital × (1 - 0.0004)  (扣除买入成本)
+      净值曲线与股价走势完全同步, 仅起点比初始资金低万四
+
+  transaction_cost_note: |
+    本作业交易成本设定:
+    - 手续费 (佣金): 万分之三 (0.03%), 双边收取 (买入和卖出各扣一次)
+    - 滑点: 万分之一 (0.01%), 双边 (买入价上浮, 卖出价下浮)
+    - 印花税: 本作业不考虑 (实际A股卖出单边收千一, 此处简化)
+    - 过户费: 本作业不考虑 (实际沪市双边收万分之零点一)
+
+    成本影响说明:
+    - 双均线策略频繁交易, 每次买卖成本 ≈ 0.08% (万八)
+    - 交易次数越多, 成本侵蚀越大
+    - 买入持有仅交易一次, 成本影响极小 (万四)
+    - 这是双均线策略相对买入持有的天然劣势, 需用超额收益覆盖
+
+# -------------------- 8. 量化指标定义 --------------------
+metrics:
+  total_return:
+    name: "总收益率"
+    formula: "策略期末净值 / 初始资金 - 1"
+    description: "策略在整个回测期间的累计收益率 (已扣除交易成本)"
+
+  annual_return:
+    name: "年化收益率"
+    formula: "(1 + total_return) ** (252 / trading_days) - 1"
+    description: "将总收益率年化, 便于与基准比较"
+
+  benchmark_return:
+    name: "基准收益率 (买入持有)"
+    formula: "买入持有期末净值 / 初始资金 - 1 (已扣除交易成本)"
+    description: "同期买入持有策略的收益率, 作为策略对比基准"
+
+  benchmark_annual_return:
+    name: "基准年化收益率"
+    formula: "(1 + benchmark_return) ** (252 / trading_days) - 1"
+    description: "买入持有策略的年化收益率"
+
+  excess_return:
+    name: "超额收益率"
+    formula: "total_return - benchmark_return"
+    description: "策略相对买入持有的超额收益, 正值说明策略优于买入持有"
+
+  win_rate:
+    name: "胜率"
+    formula: "盈利交易次数 / 总交易次数"
+    description: "每次完整买卖(买入→卖出)为一笔交易, 盈利交易占比"
+
+  max_drawdown:
+    name: "最大回撤"
+    formula: "max(1 - strategy_value[t] / running_max(strategy_value[:t]))"
+    description: "策略净值从历史最高点回落的最大幅度, 衡量风险"
+
+  benchmark_max_drawdown:
+    name: "基准最大回撤 (买入持有)"
+    formula: "max(1 - benchmark_value[t] / running_max(benchmark_value[:t]))"
+    description: "买入持有策略的最大回撤, 与策略回撤对比衡量风险控制能力"
+
+  sharpe_ratio:
+    name: "夏普比率"
+    formula: "(mean(daily_return) - risk_free_daily) / std(daily_return) * sqrt(252)"
+    params:
+      risk_free_rate: 0.02    # 无风险利率 (年化, 2%)
+      risk_free_daily: 0.02 / 252
+    description: "单位风险下的超额收益, >1 为可接受, >2 为优秀"
+
+  benchmark_sharpe_ratio:
+    name: "基准夏普比率 (买入持有)"
+    formula: "(mean(benchmark_daily_return) - risk_free_daily) / std(benchmark_daily_return) * sqrt(252)"
+    description: "买入持有策略的夏普比率, 与策略夏普对比衡量风险调整后收益"
+
+  profit_loss_ratio:
+    name: "盈亏比"
+    formula: "mean(盈利交易收益) / abs(mean(亏损交易收益))"
+    description: "平均盈利金额与平均亏损金额之比"
+
+  num_trades:
+    name: "交易次数"
+    formula: "count(完整买卖回合)"
+    description: "回测期间完成的买入→卖出交易总次数"
+
+  avg_holding_days:
+    name: "平均持仓天数"
+    formula: "mean(卖出日期 - 买入日期)"
+    description: "每笔交易的平均持有时间"
+
+  total_cost:
+    name: "总交易成本"
+    formula: "Σ (每次买入成本 + 每次卖出成本)"
+    description: "回测期间累计付出的手续费和滑点成本总额"
+
+  metrics_table_format:
+    columns: ["指标", "双均线策略", "买入持有(基准)", "差值"]
+    rows:
+      - ["总收益率", "X%", "Y%", "X-Y%"]
+      - ["年化收益率", "X%", "Y%", "X-Y%"]
+      - ["最大回撤", "X%", "Y%", "X-Y%"]
+      - ["夏普比率", "X", "Y", "X-Y"]
+      - ["胜率", "X%", "—", "—"]
+      - ["盈亏比", "X", "—", "—"]
+      - ["交易次数", "N", "1", "—"]
+      - ["平均持仓天数", "N天", "全部", "—"]
+      - ["总交易成本", "X元", "Y元", "X-Y元"]
+
+# -------------------- 9. 参数实验设计 --------------------
+experiments:
+  experiment_1:
+    name: "固定股票, 变化均线周期"
+    stock: "CATL (宁德时代)"
+    params:
+      - {short: 5,  long: 10}
+      - {short: 5,  long: 15}
+      - {short: 5,  long: 20}
+      - {short: 10, long: 20}
+      - {short: 10, long: 30}
+      - {short: 20, long: 60}
+    goal: "观察不同均线周期对收益、胜率、回撤的影响"
+
+  experiment_2:
+    name: "固定股票, 变化均线周期"
+    stock: "SMIC (中芯国际)"
+    params: "同 experiment_1"
+    goal: "观察同一策略在不同股票上的表现差异"
+
+  experiment_3:
+    name: "跨股票对比"
+    stocks: ["CATL", "SMIC"]
+    fixed_params: {short: 5, long: 15}
+    fixed_window: "full"
+    goal: "比较双均线策略在动力电池板块 vs 半导体板块的适用性"
+
+  experiment_4:
+    name: "固定股票和均线, 变化时间窗口"
+    stock: "CATL (宁德时代)"
+    fixed_params: {short: 5, long: 15}
+    windows: ["full", "recent_3m", "recent_6m", "recent_12m"]
+    goal: "观察同一策略在不同市场阶段 (牛市/熊市/震荡) 的表现差异"
+
+  experiment_5:
+    name: "固定股票和均线, 变化时间窗口"
+    stock: "SMIC (中芯国际)"
+    fixed_params: {short: 5, long: 15}
+    windows: ["full", "recent_3m", "recent_6m", "recent_12m"]
+    goal: "观察SMIC在不同市场阶段的表现差异, 与CATL对比"
+
+  output_format:
+    type: "对比表格 + 柱状图"
+    columns: ["股票", "短均线", "长均线", "时间窗口", "交易日数",
+              "总收益率", "年化收益率",
+              "基准收益率", "超额收益", "最大回撤", "基准最大回撤",
+              "夏普比率", "基准夏普比率", "胜率", "交易次数",
+              "总交易成本"]
+    file: "dual_ma_experiment_results.csv"
+
+# -------------------- 10. 策略总结要求 --------------------
+summary:
+  required_sections:
+    - title: "双均线策略适用场景"
+      points:
+        - "趋势行情 (牛市/熊市) 中表现优异"
+        - "震荡行情中频繁假信号, 收益可能为负"
+        - "长周期均线组合 (如20/60) 信号少但更可靠"
+        - "短周期均线组合 (如5/10) 信号多但噪声大"
+
+    - title: "不同股票的表现差异分析"
+      points:
+        - "宁德时代 (动力电池): 波动特征, 趋势性, 策略表现"
+        - "中芯国际 (半导体): 波动特征, 趋势性, 策略表现"
+        - "行业属性对策略效果的影响"
+
+    - title: "参数选择心得"
+      points:
+        - "短均线周期过短 → 信号过于频繁, 交易成本侵蚀收益"
+        - "长均线周期过长 → 信号滞后, 错过行情起点"
+        - "均线周期选择应结合个股波动率和持仓周期偏好"
+        - "建议: 波动大的股票用较长周期, 波动小的用较短周期"
+
+    - title: "不同时间窗口的表现差异分析"
+      points:
+        - "牛市阶段: 趋势明确, 金叉信号有效, 策略大概率跑赢或接近买入持有"
+        - "熊市阶段: 死叉信号帮助规避下跌, 策略可能大幅跑赢买入持有"
+        - "震荡阶段: 频繁假信号, 反复止损, 策略可能跑输买入持有"
+        - "时间窗口选择应覆盖不同市场环境, 避免仅在单一行情下评估"
+
+    - title: "策略局限与改进方向"
+      points:
+        - "单一指标策略局限性大, 容易在震荡市亏损"
+        - "可加入成交量、MACD、RSI 等辅助过滤信号"
+        - "可加入止损/止盈机制控制风险"
+        - "可尝试动态调仓而非满仓/空仓二选一"
+        - "交易成本(手续费万三+滑点万一)对高频策略影响显著, 需用超额收益覆盖"
+        - "与买入持有对比: 若策略无法跑赢买入持有, 说明趋势判断未带来正增益"
+
+# -------------------- 11. 文件输出规范 --------------------
+output_files:
+  strategy_script:
+    name: "dual_ma_strategy.py"
+    description: "主策略脚本, 包含数据加载、均线计算、信号生成、回测、可视化"
+    functions:
+      - load_and_clean(stock_name): "加载并清洗股票数据"
+      - calc_ma(df, short, long): "计算双均线"
+      - gen_signals(df): "生成买卖信号"
+      - select_window(df, time_window): "按时间窗口截取回测数据 (含预热期)"
+      - backtest(df, initial_capital): "执行回测, 返回净值和交易记录"
+      - backtest_benchmark(df, initial_capital): "执行买入持有回测, 返回净值"
+      - calc_metrics(backtest_result, benchmark_result): "计算双均线与基准的量化指标"
+      - plot_dashboard(df, metrics, stock_name, time_window): "绘制可视化看板"
+      - run_experiment(stock_name, param_list, window_list): "参数+时间窗口实验"
+
+  dashboard:
+    pattern: "{short_name}_dual_ma_dashboard.html"
+    examples:
+      - "CATL_dual_ma_dashboard.html"
+      - "SMIC_dual_ma_dashboard.html"
+
+  results_csv:
+    pattern: "{short_name}_dual_ma_results.csv"
+    description: "回测指标明细表"
+
+  experiment_csv:
+    name: "dual_ma_experiment_results.csv"
+    description: "参数实验汇总对比表"
+
+  report_pdf:
+    name: "郭美杰+TASK2.pdf"
+    description: "最终作业报告 (策略原理+回测结果+图表+总结心得)"
+
+# -------------------- 12. 技术栈 --------------------
+tech_stack:
+  language: "Python 3.12+"
+  libraries:
+    pandas: "数据处理"
+    numpy: "数值计算"
+    matplotlib: "PDF报告静态图表"
+    echarts: "HTML交互式看板 (通过CDN引入)"
+  data_source: "已存储的本地CSV文件 (无需联网获取)"
+  font: "宋体五号, 1.5倍行距 (PDF报告)"
+
+# -------------------- 13. 复现步骤 (SOP) --------------------
+reproduction_sop:
+  step_1:
+    name: "环境准备"
+    actions:
+      - "确认 Python 3.12+ 已安装"
+      - "pip install pandas numpy matplotlib"
+      - "确认数据文件在项目根目录: CATL_300750_daily_qfq.csv, SMIC_688981_daily_qfq.csv"
+
+  step_2:
+    name: "运行策略脚本"
+    actions:
+      - "python dual_ma_strategy.py"
+      - "脚本自动加载两支股票数据"
+      - "使用默认参数 (5日/15日) 执行回测"
+
+  step_3:
+    name: "查看输出"
+    actions:
+      - "终端打印回测指标摘要"
+      - "生成 HTML 看板: CATL_dual_ma_dashboard.html, SMIC_dual_ma_dashboard.html"
+      - "生成结果CSV: CATL_dual_ma_results.csv, SMIC_dual_ma_results.csv"
+
+  step_4:
+    name: "参数实验"
+    actions:
+      - "脚本自动运行6组参数 × 2支股票 = 12次回测"
+      - "生成对比表: dual_ma_experiment_results.csv"
+
+  step_5:
+    name: "生成报告"
+    actions:
+      - "运行 generate_report.py 生成PDF报告"
+      - "报告包含: 策略原理、回测结果、可视化图表、参数对比、总结心得"
+
+  step_6:
+    name: "自定义扩展"
+    actions:
+      - "修改 dual_ma_strategy.py 中的 PARAM_GRID 添加更多参数组合"
+      - "修改 TIME_WINDOW 选择不同回测区间 (full/recent_3m/recent_6m/recent_12m/custom)"
+      - "替换数据文件以测试其他股票"
+      - "调整 BACKTEST_CONFIG 中的初始资金、佣金费率等参数"

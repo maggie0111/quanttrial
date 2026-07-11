@@ -1,0 +1,856 @@
+# ============================================================
+# Turtle Trading Strategy Specification (海龟交易法则策略规范)
+# Version: 1.0
+# Created: 2026-07-11
+# Description: 标准化海龟交易法则策略的完整流程，涵盖数据加载、高低价格通道
+#              (唐奇安通道)、ATR 计算、信号生成、可视化、回测评卡、
+#              参数实验与策略总结，含买入持有基准对比
+# Author: 郭美杰
+# ============================================================
+
+# -------------------- 1. 策略概述 --------------------
+strategy:
+  name: "Turtle Trading Strategy (海龟交易法则)"
+  type: "趋势突破 / Breakout Trend Following"
+  origin: |
+    海龟交易法则由 Richard Dennis 和 William Eckhardt 于 1983 年提出，
+    通过一套机械化的趋势突破规则培训了一批交易员（"海龟"），
+    验证了交易能力可以通过系统化规则传授的假说。
+  principle: |
+    核心思想：价格突破近期高点时买入（趋势启动），价格跌破近期低点时卖出（趋势结束）。
+    - 唐奇安通道 (Donchian Channel) 作为突破判断基准：
+      上轨 = 过去 N 日最高价 (不含当日)
+      下轨 = 过去 M 日最低价 (不含当日)
+    - ATR (平均真实波幅) 用于衡量市场波动率，辅助止损和仓位管理
+    - 入场：收盘价突破上轨 → 买入
+    - 离场：收盘价跌破下轨 → 卖出
+  core_logic:
+    - "突破上轨代表多方力量压倒空方，新趋势可能启动"
+    - "跌破下轨代表空方力量占优，趋势可能反转或结束"
+    - "ATR 动态衡量波动率，适应不同波动环境"
+    - "通道周期越长，信号越少但越可靠；周期越短，信号越多但噪声大"
+  applicability: |
+    适用于趋势明显的行情（单边上涨或下跌），在震荡市中会频繁出现假突破
+    导致反复止损。海龟法则本质是"截断亏损，让利润奔跑"的趋势跟踪策略，
+    胜率通常不高（30%-50%），但盈亏比优秀（大赚小亏）。
+
+# -------------------- 2. 股票池与数据文件 --------------------
+stocks:
+  - name: "宁德时代"
+    short_name: "CATL"
+    sector: "动力电池 / 新能源"
+    exchange: "SZSE"
+    ts_code: "300750.SZ"
+    data_file: "CATL_300750_daily_qfq.csv"
+    data_status: "已前复权(qfq)，时间正序，可直接使用"
+    date_range: "20250704 ~ 20260703"
+    trading_days: 242
+    columns:
+      - trade_date
+      - open
+      - high
+      - low
+      - close
+      - volume
+      - amount
+      - pct_chg
+      - adj_factor
+    notes: "数据完整，无需额外清洗。本作业主要使用该股票。"
+
+  - name: "中芯国际"
+    short_name: "SMIC"
+    sector: "半导体 / 集成电路制造"
+    exchange: "SSE (科创板)"
+    ts_code: "688981.SH"
+    data_file: "SMIC_688981_daily_qfq.csv"
+    data_status: "已前复权(qfq)，时间正序，可直接使用"
+    date_range: "20250701 ~ 20260701"
+    trading_days: 237
+    columns:
+      - trade_date
+      - open
+      - high
+      - low
+      - close
+      - volume
+      - amount
+      - pct_chg
+      - adj_factor
+    notes: "用于参数实验中的跨股票对比"
+
+# -------------------- 3. 数据加载与预处理 --------------------
+data_preprocessing:
+  step_1_load:
+    name: "加载CSV数据"
+    actions:
+      - "使用 pandas.read_csv 读取，dtype={'trade_date': str} 保留日期为字符串"
+      - "CATL: 直接加载 CATL_300750_daily_qfq.csv"
+      - "SMIC: 直接加载 SMIC_688981_daily_qfq.csv"
+
+  step_2_clean:
+    name: "数据清洗"
+    actions:
+      - "检查无缺失值 (dropna)"
+      - "检查 close > 0, 过滤异常行"
+      - "reset_index(drop=True)"
+
+  step_3_validate:
+    name: "数据校验"
+    checks:
+      - "所有 close > 0"
+      - "low <= open <= high 且 low <= close <= high"
+      - "volume >= 0"
+      - "trade_date 无重复值"
+      - "日期连续性检查 (排除周末和节假日后的缺口属正常)"
+
+  step_4_standardize:
+    name: "输出标准化DataFrame"
+    unified_columns:
+      - trade_date: "string, YYYYMMDD"
+      - open: "float"
+      - high: "float, 计算通道上轨的关键字段"
+      - low: "float, 计算通道下轨的关键字段"
+      - close: "float, 策略使用收盘价判断突破"
+      - volume: "float"
+      - pct_chg: "float, 涨跌幅%"
+    notes: "海龟策略需要 high/low/close 三个价格序列，均已在 qfq 数据中提供"
+
+# -------------------- 4. 唐奇安通道计算 --------------------
+donchian_channel:
+  definition: |
+    唐奇安通道 (Donchian Channel) 由三条线组成：
+    - 上轨 (Upper): 过去 N 个交易日最高价的最大值 (不含当日)
+    - 下轨 (Lower): 过去 M 个交易日最低价的最小值 (不含当日)
+    - 中轨 (Mid): (上轨 + 下轨) / 2
+
+    注意: 计算上轨时使用 high 序列，计算下轨时使用 low 序列
+          突破判断使用 close 序列
+
+  default_params:
+    entry_period: 20      # 入场通道周期 (上轨 = 20日最高价)
+    exit_period: 10       # 出场通道周期 (下轨 = 10日最低价)
+
+  alternative_params:      # 参数实验用
+    - {entry: 10, exit: 5}      # 短周期，信号频繁
+    - {entry: 15, exit: 7}      # 中短周期
+    - {entry: 20, exit: 10}     # 经典海龟参数 (默认)
+    - {entry: 25, exit: 12}     # 中长周期
+    - {entry: 30, exit: 15}     # 长周期，信号少
+    - {entry: 55, exit: 20}     # 海龟长线系统参数
+
+  calculation:
+    method: |
+      # 上轨: 过去 N 日最高价 (shift(1) 确保不含当日)
+      upper = df['high'].rolling(window=entry_period).max().shift(1)
+
+      # 下轨: 过去 M 日最低价 (shift(1) 确保不含当日)
+      lower = df['low'].rolling(window=exit_period).min().shift(1)
+
+      # 中轨
+      mid = (upper + lower) / 2
+
+    shift_explanation: |
+      shift(1) 的作用：确保通道值只使用 t-1 及之前的数据，不含当日。
+      这样当日收盘价与"过去 N 日"的通道比较，避免未来数据泄露 (look-ahead bias)。
+
+  output_columns:
+    - upper_channel: "上轨 (N日最高价)"
+    - lower_channel: "下轨 (M日最低价)"
+    - mid_channel: "中轨"
+
+  notes:
+    - "通道周期 N 通常取 20 (经典海龟短线系统) 或 55 (长线系统)"
+    - "出场周期 M 一般取 N/2，即 10 或 20"
+    - "前 max(N, M)-1 个交易日为 NaN，不产生信号"
+
+# -------------------- 5. ATR 计算 --------------------
+atr:
+  definition: |
+    ATR (Average True Range, 平均真实波幅) 由 J. Welles Wilder 提出，
+    用于衡量市场波动率。
+
+    True Range (TR) 的计算:
+      TR(t) = max(
+        high(t) - low(t),                      # 当日波幅
+        abs(high(t) - close(t-1)),             # 跳空高开波幅
+        abs(low(t) - close(t-1))               # 跳空低开波幅
+      )
+
+    ATR = TR 的 N 日简单移动平均 (SMA) 或 Wilder 平滑平均 (EMA)
+
+  default_params:
+    atr_period: 20         # ATR 计算周期 (与入场通道一致)
+
+  calculation:
+    method: |
+      # Step 1: 计算 True Range
+      prev_close = df['close'].shift(1)
+      tr1 = df['high'] - df['low']
+      tr2 = (df['high'] - prev_close).abs()
+      tr3 = (df['low'] - prev_close).abs()
+      tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+      # Step 2: 计算 ATR (SMA 方式, 简单直观)
+      atr = tr.rolling(window=atr_period).mean()
+
+      # 备选: Wilder 平滑方式 (更接近原始海龟)
+      # atr = tr.ewm(alpha=1/atr_period, adjust=False).mean()
+
+    prev_close_handling: |
+      第一个交易日无 close(t-1)，TR 退化为 high - low。
+      可用 tr.iloc[0] = high.iloc[0] - low.iloc[0] 填充，或留 NaN。
+
+  output_columns:
+    - TR: "当日真实波幅"
+    - ATR: "ATR 平均真实波幅"
+
+  usage_in_strategy: |
+    ATR 在本策略中用于:
+    1. 可选: 仓位管理 — 单位头寸 = (资金 × 1%) / (ATR × 合约乘数)
+       本作业股票合约乘数=1 (1股)，简化为: unit = (资金 × 0.01) / ATR
+    2. 可选: 动态止损 — 止损价 = 买入价 - 2 × ATR
+    3. 波动率参考 — 可视化中展示 ATR 辅助判断市场状态
+
+    本作业默认: 满仓买入/卖出 (不做仓位管理)，ATR 用于可视化和可选止损
+
+  notes:
+    - "ATR 周期通常与入场通道周期一致 (20日)"
+    - "ATR 不直接产生买卖信号，但影响仓位和止损"
+    - "高 ATR 表示市场波动大，低 ATR 表示市场平静"
+
+# -------------------- 6. 交易信号生成 --------------------
+signals:
+  signal_logic:
+    buy_signal:
+      condition: "close(t) > upper_channel(t) AND position == 0"
+      action: "BUY (买入)"
+      meaning: "收盘价突破过去 N 日最高价，趋势向上启动"
+    sell_signal:
+      condition: "close(t) < lower_channel(t) AND position == 1"
+      action: "SELL (卖出)"
+      meaning: "收盘价跌破过去 M 日最低价，趋势向下结束"
+    hold:
+      condition: "无突破发生"
+      action: "HOLD (持有/空仓)"
+      meaning: "维持当前仓位不变"
+
+  breakthrough_detail: |
+    突破判断严格使用"当日收盘价"与"过去 N 日通道"比较：
+    - upper_channel(t) = max(high(t-N) ... high(t-1))  ← 不含当日
+    - buy 当 close(t) > upper_channel(t)
+
+    这确保信号在当日收盘后确认，不会使用未来数据。
+
+  implementation:
+    method: |
+      signal = pd.Series(0, index=df.index)
+
+      for t in range(1, len(df)):
+        if pd.isna(upper_channel[t]) or pd.isna(lower_channel[t]):
+          continue
+
+        # 买入: 收盘价突破上轨且当前空仓
+        if df['close'][t] > upper_channel[t] and position[t-1] == 0:
+          signal[t] = 1
+          position[t] = 1
+
+        # 卖出: 收盘价跌破下轨且当前持仓
+        elif df['close'][t] < lower_channel[t] and position[t-1] == 1:
+          signal[t] = -1
+          position[t] = 0
+
+        # 维持
+        else:
+          position[t] = position[t-1]
+
+  output_columns:
+    - signal: "1=买入, -1=卖出, 0=无操作"
+    - position: "当前持仓状态: 1=持仓, 0=空仓 (根据信号累积)"
+
+  position_tracking: |
+    position[0] = 0  # 初始空仓
+    遍历每个交易日:
+      if signal[t] == 1:  position[t] = 1  (买入并持有)
+      if signal[t] == -1: position[t] = 0  (卖出空仓)
+      if signal[t] == 0:  position[t] = position[t-1]  (维持)
+
+  trading_rules:
+    - "信号在当日收盘后确认，当日收盘价成交 (或次日开盘执行)"
+    - "同一时间最多持有一手 (满仓/空仓二选一)"
+    - "不考虑做空，仅在持仓时盈利/亏损"
+    - "每次交易全额买入/卖出 (无仓位管理，简化版)"
+    - "通道计算使用 shift(1)，确保不含当日数据 (无未来函数)"
+
+  optional_stop_loss: |
+    可选止损机制 (默认关闭，参数实验可开启):
+    - 买入后设置止损价 = 买入价 - 2 × ATR(买入日)
+    - 若后续收盘价 < 止损价 → 提前卖出
+    - 止损后等待新的突破信号再入场
+    - 此机制可显著降低最大回撤，但可能减少盈利交易
+
+# -------------------- 7. 可视化要求 --------------------
+visualization:
+  chart_type: "HTML 交互式看板 (ECharts)"
+  color_convention: "A股惯例: 红涨绿跌 (red=up, green=down)"
+  library: "ECharts via CDN"
+  file_naming: "{short_name}_turtle_dashboard.html"
+
+  chart_components:
+    main_chart:
+      type: "K线图 + 通道折线 (Candlestick + Line)"
+      series:
+        - candlestick: "日K线, 红涨绿跌 (close>open=红, close<open=绿)"
+        - upper_channel: "上轨折线, 颜色 #FF6B6B (浅红), 线宽 1.2, 半透明"
+        - lower_channel: "下轨折线, 颜色 #4ECDC4 (青), 线宽 1.2, 半透明"
+        - mid_channel: "中轨折线, 颜色 #999999 (灰), 线宽 1, 虚线, 半透明"
+      x_axis: "trade_date"
+      y_axis: "价格 (元)"
+      title: "{股票名称} 海龟交易法则 ({entry}日入场/{exit}日出场)"
+      notes: "K线直观展示 OHLC，通道叠加在K线上方，突破一目了然"
+
+    signal_markers:
+      buy_markers:
+        type: "标记点 (markPoint)"
+        condition: "signal == 1"
+        symbol: "triangle (向上箭头)"
+        color: "#FF0000 (红色)"
+        label: "买入"
+        position: "below the low price (y_offset = -5)"
+      sell_markers:
+        type: "标记点 (markPoint)"
+        condition: "signal == -1"
+        symbol: "triangle (向下箭头)"
+        color: "#00AA00 (绿色)"
+        label: "卖出"
+        position: "above the high price (y_offset = +5)"
+
+    volume_chart:
+      type: "柱状图 (Bar Chart)"
+      color: "红涨绿跌 (根据当日 close>open 着色)"
+      y_axis: "成交量 (手)"
+
+    atr_chart:
+      type: "柱状图 + 折线"
+      title: "ATR (平均真实波幅)"
+      series:
+        - TR_bar: "当日 TR 柱状图, 颜色 #AAAAAA (浅灰)"
+        - ATR_line: "ATR 折线, 颜色 #EE6666 (橙红), 线宽 1.5"
+      y_axis: "波幅 (元)"
+      notes: "展示市场波动率变化，辅助判断趋势强度"
+
+    backtest_chart:
+      type: "折线图"
+      title: "策略净值 vs 买入持有 (基准对比)"
+      series:
+        - strategy_value: "海龟策略净值曲线, 颜色 #5470C6 (蓝), 实线"
+        - benchmark_value: "买入持有净值曲线, 颜色 #91CC75 (绿), 虚线"
+        - initial_capital: "初始资金基准线, 颜色 #999999, 水平虚线"
+      y_axis: "净值 (元)"
+      annotations:
+        - "策略最终收益率标注"
+        - "买入持有最终收益率标注"
+        - "超额收益标注 (策略 - 基准)"
+
+    position_chart:
+      type: "面积图 (Area)"
+      title: "持仓状态"
+      series:
+        - position: "1=持仓(蓝色填充), 0=空仓(空白)"
+      y_axis: "持仓 (1/0)"
+      notes: "直观展示策略的持仓/空仓时间段"
+
+  layout:
+    - "主图 (K线+通道+信号标记) 占上方 45% 高度"
+    - "成交量图 占 12% 高度"
+    - "ATR图 占 13% 高度"
+    - "净值对比图 占 18% 高度"
+    - "持仓状态图 占 12% 高度"
+    - "五图共享 x 轴 (trade_date), 联动 tooltip"
+
+# -------------------- 8. 回测引擎 --------------------
+backtest:
+  assumptions:
+    initial_capital: 100000       # 初始资金 (元)
+    position_size: "full"         # 满仓买入/卖出 (简化版, 不做ATR仓位管理)
+    commission_rate: 0.0003       # 手续费费率 (万三, 双边收取)
+    slippage: 0.0001              # 滑点费率 (万一, 双边)
+    stamp_duty: 0                 # 印花税 (本作业不考虑)
+    trade_price: "close"          # 以当日收盘价成交 (信号当日确认后执行)
+
+  time_window:
+    description: |
+      回测时间窗口 — 从全量历史数据中截取的一段区间用于回测。
+      不同时间窗口对应不同的市场环境（牛市/熊市/震荡），
+      观察策略在不同行情阶段的表现差异。
+    default_mode: "full"          # 默认使用全部数据
+
+    options:
+      - mode: "full"
+        name: "全周期"
+        description: "使用全部可用交易日数据"
+        catl_range: "20250704 ~ 20260703 (242天)"
+        smic_range: "20250701 ~ 20260701 (237天)"
+
+      - mode: "recent_3m"
+        name: "近3个月"
+        description: "截取最近约63个交易日 (一个季度)"
+        catl_range: "约 20260401 ~ 20260703"
+        smic_range: "约 20260401 ~ 20260701"
+
+      - mode: "recent_6m"
+        name: "近6个月"
+        description: "截取最近约126个交易日 (半年)"
+        catl_range: "约 20260101 ~ 20260703"
+        smic_range: "约 20260101 ~ 20260701"
+
+      - mode: "recent_12m"
+        name: "近12个月"
+        description: "截取最近约252个交易日 (一年, 近似全周期)"
+        catl_range: "约 20250704 ~ 20260703"
+        smic_range: "约 20250701 ~ 20260701"
+
+      - mode: "custom"
+        name: "自定义区间"
+        description: "用户指定 start_date 和 end_date (YYYYMMDD)"
+        params:
+          start_date: "YYYYMMDD"
+          end_date: "YYYYMMDD"
+
+    selection_method: |
+      在策略脚本中通过 TIME_WINDOW 参数选择:
+        TIME_WINDOW = "full"          # 全周期 (默认)
+        TIME_WINDOW = "recent_3m"     # 近3个月
+        TIME_WINDOW = "recent_6m"     # 近6个月
+        TIME_WINDOW = "recent_12m"    # 近12个月
+        TIME_WINDOW = {"mode": "custom", "start_date": "20260101", "end_date": "20260401"}
+
+      数据截取逻辑:
+        if mode == "full":
+            df_bt = df  # 全部数据
+        elif mode == "recent_Nm":
+            cutoff = df["trade_date"].iloc[-1] 减去 N*21 个交易日
+            df_bt = df[df["trade_date"] >= cutoff]
+        elif mode == "custom":
+            df_bt = df[(df["trade_date"] >= start_date) & (df["trade_date"] <= end_date)]
+
+      注意: 通道计算使用截取后的数据, 截取区间起始的前 max(entry,exit)-1 天
+            仍需计入数据以使通道有效 (实际截取时多取 entry_period 天作为预热期)
+
+  cost_model: |
+    交易成本 = 手续费 + 滑点, 双边收取 (买入和卖出各扣一次)
+
+    买入实际成交价 = close[t] × (1 + slippage)
+    买入扣除手续费后单价 = 买入实际成交价 × (1 + commission_rate)
+    → 每股买入成本 = close[t] × (1 + 0.0001) × (1 + 0.0003)
+                  = close[t] × 1.0004  (近似)
+
+    卖出实际成交价 = close[t] × (1 - slippage)
+    卖出扣除手续费后单价 = 卖出实际成交价 × (1 - commission_rate)
+    → 每股卖出收入 = close[t] × (1 - 0.0001) × (1 - 0.0003)
+                   = close[t] × 0.9996  (近似)
+
+    单次完整交易(买入+卖出)成本率 ≈ 0.08% (万八)
+
+  execution_logic: |
+    capital = initial_capital
+    shares = 0
+    position = 0  # 0=空仓, 1=持仓
+    strategy_value = []  # 每日净值序列
+    trades = []  # 交易记录
+
+    for each trading_day t:
+      if signal[t] == BUY and position == 0:
+        # 买入: 价格上浮滑点, 再扣手续费
+        fill_price = close[t] * (1 + slippage)
+        cost_per_share = fill_price * (1 + commission_rate)
+        shares = capital / cost_per_share
+        capital = 0
+        position = 1
+        trades.append({
+          "date": trade_date[t],
+          "action": "BUY",
+          "signal_price": close[t],
+          "fill_price": fill_price,
+          "shares": shares,
+          "cost": shares * cost_per_share,
+          "atr": atr[t],
+          "upper_channel": upper_channel[t]
+        })
+
+      elif signal[t] == SELL and position == 1:
+        # 卖出: 价格下浮滑点, 再扣手续费
+        fill_price = close[t] * (1 - slippage)
+        revenue_per_share = fill_price * (1 - commission_rate)
+        capital = shares * revenue_per_share
+        trades.append({
+          "date": trade_date[t],
+          "action": "SELL",
+          "signal_price": close[t],
+          "fill_price": fill_price,
+          "revenue": capital,
+          "shares": shares,
+          "lower_channel": lower_channel[t]
+        })
+        shares = 0
+        position = 0
+
+      # 记录当日净值 (持仓时按收盘价估值)
+      daily_value = capital + shares * close[t]
+      strategy_value.append(daily_value)
+
+    final_value = strategy_value[-1]
+
+  benchmark:
+    name: "Buy and Hold (买入持有策略)"
+    description: |
+      作为海龟策略的对比基准。首日全仓买入，持有至末日卖出。
+      同样扣除手续费和滑点，确保对比公平。
+    execution_logic: |
+      # 买入持有: 第一个交易日全仓买入
+      fill_price_buy = close[0] * (1 + slippage)
+      cost_per_share = fill_price_buy * (1 + commission_rate)
+      shares = initial_capital / cost_per_share
+      capital = 0
+      position = 1
+
+      benchmark_value = []
+      for each trading_day t:
+        daily_value = capital + shares * close[t]
+        benchmark_value.append(daily_value)
+
+      # 末日估值 (若实际卖出需扣成本, 此处按收盘价估值以便与策略一致)
+      final_value = benchmark_value[-1]
+
+      # 如需计算卖出后净收益:
+      fill_price_sell = close[-1] * (1 - slippage)
+      revenue_per_share = fill_price_sell * (1 - commission_rate)
+      final_cash = shares * revenue_per_share
+    net_value_curve: |
+      买入持有策略每日净值 = shares × close[t]
+      首日净值 = initial_capital × (1 - 0.0004)  (扣除买入成本)
+      净值曲线与股价走势完全同步, 仅起点比初始资金低万四
+
+  transaction_cost_note: |
+    本作业交易成本设定:
+    - 手续费 (佣金): 万分之三 (0.03%), 双边收取 (买入和卖出各扣一次)
+    - 滑点: 万分之一 (0.01%), 双边 (买入价上浮, 卖出价下浮)
+    - 印花税: 本作业不考虑 (实际A股卖出单边收千一, 此处简化)
+    - 过户费: 本作业不考虑 (实际沪市双边收万分之零点一)
+
+    成本影响说明:
+    - 海龟策略属于中低频趋势策略, 交易次数通常比双均线少
+    - 每次买卖成本 ≈ 0.08% (万八)
+    - 买入持有仅交易一次, 成本影响极小 (万四)
+    - 趋势策略的收益来自大波段, 交易成本占比较小
+
+# -------------------- 9. 量化指标定义 --------------------
+metrics:
+  total_return:
+    name: "总收益率"
+    formula: "策略期末净值 / 初始资金 - 1"
+    description: "策略在整个回测期间的累计收益率 (已扣除交易成本)"
+
+  annual_return:
+    name: "年化收益率"
+    formula: "(1 + total_return) ** (252 / trading_days) - 1"
+    description: "将总收益率年化, 便于与基准比较"
+
+  benchmark_return:
+    name: "基准收益率 (买入持有)"
+    formula: "买入持有期末净值 / 初始资金 - 1 (已扣除交易成本)"
+    description: "同期买入持有策略的收益率, 作为策略对比基准"
+
+  benchmark_annual_return:
+    name: "基准年化收益率"
+    formula: "(1 + benchmark_return) ** (252 / trading_days) - 1"
+    description: "买入持有策略的年化收益率"
+
+  excess_return:
+    name: "超额收益率"
+    formula: "total_return - benchmark_return"
+    description: "策略相对买入持有的超额收益, 正值说明策略优于买入持有"
+
+  win_rate:
+    name: "胜率"
+    formula: "盈利交易次数 / 总交易次数"
+    description: "每次完整买卖(买入→卖出)为一笔交易, 盈利交易占比。海龟策略胜率通常较低(30%-50%)"
+
+  max_drawdown:
+    name: "最大回撤"
+    formula: "max(1 - strategy_value[t] / running_max(strategy_value[:t]))"
+    description: "策略净值从历史最高点回落的最大幅度, 衡量风险"
+
+  benchmark_max_drawdown:
+    name: "基准最大回撤 (买入持有)"
+    formula: "max(1 - benchmark_value[t] / running_max(benchmark_value[:t]))"
+    description: "买入持有策略的最大回撤, 与策略回撤对比衡量风险控制能力"
+
+  sharpe_ratio:
+    name: "夏普比率"
+    formula: "(mean(daily_return) - risk_free_daily) / std(daily_return) * sqrt(252)"
+    params:
+      risk_free_rate: 0.02    # 无风险利率 (年化, 2%)
+      risk_free_daily: 0.02 / 252
+    description: "单位风险下的超额收益, >1 为可接受, >2 为优秀"
+
+  benchmark_sharpe_ratio:
+    name: "基准夏普比率 (买入持有)"
+    formula: "(mean(benchmark_daily_return) - risk_free_daily) / std(benchmark_daily_return) * sqrt(252)"
+    description: "买入持有策略的夏普比率, 与策略夏普对比衡量风险调整后收益"
+
+  profit_loss_ratio:
+    name: "盈亏比"
+    formula: "mean(盈利交易收益) / abs(mean(亏损交易收益))"
+    description: "平均盈利金额与平均亏损金额之比。海龟策略盈亏比通常较高(2-3以上)"
+
+  num_trades:
+    name: "交易次数"
+    formula: "count(完整买卖回合)"
+    description: "回测期间完成的买入→卖出交易总次数"
+
+  avg_holding_days:
+    name: "平均持仓天数"
+    formula: "mean(卖出日期 - 买入日期)"
+    description: "每笔交易的平均持有时间。海龟策略持仓周期通常较长(数周到数月)"
+
+  total_cost:
+    name: "总交易成本"
+    formula: "Σ (每次买入成本 + 每次卖出成本)"
+    description: "回测期间累计付出的手续费和滑点成本总额"
+
+  max_single_profit:
+    name: "最大单笔盈利"
+    formula: "max(每笔交易收益率)"
+    description: "最成功的一笔交易的收益率, 体现趋势跟踪'让利润奔跑'的特点"
+
+  max_single_loss:
+    name: "最大单笔亏损"
+    formula: "min(每笔交易收益率)"
+    description: "最失败的一笔交易的收益率, 体现'截断亏损'的效果"
+
+  metrics_table_format:
+    columns: ["指标", "海龟策略", "买入持有(基准)", "差值"]
+    rows:
+      - ["总收益率", "X%", "Y%", "X-Y%"]
+      - ["年化收益率", "X%", "Y%", "X-Y%"]
+      - ["最大回撤", "X%", "Y%", "X-Y%"]
+      - ["夏普比率", "X", "Y", "X-Y"]
+      - ["胜率", "X%", "—", "—"]
+      - ["盈亏比", "X", "—", "—"]
+      - ["交易次数", "N", "1", "—"]
+      - ["平均持仓天数", "N天", "全部", "—"]
+      - ["最大单笔盈利", "X%", "—", "—"]
+      - ["最大单笔亏损", "X%", "—", "—"]
+      - ["总交易成本", "X元", "Y元", "X-Y元"]
+
+# -------------------- 10. 参数实验设计 --------------------
+experiments:
+  experiment_1:
+    name: "固定股票, 变化通道周期 (CATL)"
+    stock: "CATL (宁德时代)"
+    params:
+      - {entry: 10, exit: 5}
+      - {entry: 15, exit: 7}
+      - {entry: 20, exit: 10}   # 默认 (经典海龟)
+      - {entry: 25, exit: 12}
+      - {entry: 30, exit: 15}
+      - {entry: 55, exit: 20}   # 海龟长线系统
+    goal: "观察不同通道周期对收益、胜率、回撤、盈亏比的影响"
+
+  experiment_2:
+    name: "固定股票, 变化通道周期 (SMIC)"
+    stock: "SMIC (中芯国际)"
+    params: "同 experiment_1"
+    goal: "观察同一策略在不同股票上的表现差异"
+
+  experiment_3:
+    name: "跨股票对比"
+    stocks: ["CATL", "SMIC"]
+    fixed_params: {entry: 20, exit: 10}
+    fixed_window: "full"
+    goal: "比较海龟策略在动力电池板块 vs 半导体板块的适用性"
+
+  experiment_4:
+    name: "固定股票和通道, 变化时间窗口 (CATL)"
+    stock: "CATL (宁德时代)"
+    fixed_params: {entry: 20, exit: 10}
+    windows: ["full", "recent_3m", "recent_6m", "recent_12m"]
+    goal: "观察同一策略在不同市场阶段 (牛市/熊市/震荡) 的表现差异"
+
+  experiment_5:
+    name: "固定股票和通道, 变化时间窗口 (SMIC)"
+    stock: "SMIC (中芯国际)"
+    fixed_params: {entry: 20, exit: 10}
+    windows: ["full", "recent_3m", "recent_6m", "recent_12m"]
+    goal: "观察SMIC在不同市场阶段的表现差异, 与CATL对比"
+
+  experiment_6:
+    name: "ATR 止损对比实验 (可选)"
+    stock: "CATL (宁德时代)"
+    fixed_params: {entry: 20, exit: 10}
+    variants:
+      - {stop_loss: false, name: "无止损 (默认)"}
+      - {stop_loss: true, atr_multiplier: 2, name: "2×ATR 止损"}
+      - {stop_loss: true, atr_multiplier: 3, name: "3×ATR 止损"}
+    goal: "观察 ATR 动态止损对最大回撤和收益率的影响"
+
+  output_format:
+    type: "对比表格 + 柱状图"
+    columns: ["股票", "入场周期", "出场周期", "时间窗口", "交易日数",
+              "总收益率", "年化收益率",
+              "基准收益率", "超额收益", "最大回撤", "基准最大回撤",
+              "夏普比率", "基准夏普比率", "胜率", "盈亏比",
+              "交易次数", "平均持仓天数", "总交易成本"]
+    file: "turtle_experiment_results.csv"
+
+# -------------------- 11. 策略总结要求 --------------------
+summary:
+  required_sections:
+    - title: "海龟法则适用场景"
+      points:
+        - "趋势行情 (牛市/熊市) 中表现优异, 能捕捉大波段利润"
+        - "震荡行情中频繁假突破, 收益可能为负"
+        - "长周期通道 (如55/20) 信号少但更可靠, 适合中长线投资者"
+        - "短周期通道 (如10/5) 信号多但噪声大, 适合短线交易者"
+        - "本质是'截断亏损, 让利润奔跑', 胜率低但盈亏比高"
+
+    - title: "不同股票的表现差异分析"
+      points:
+        - "宁德时代 (动力电池): 波动特征, 趋势性, 突破有效性, 策略表现"
+        - "中芯国际 (半导体): 波动特征, 趋势性, 突破有效性, 策略表现"
+        - "行业属性对突破策略效果的影响 (科技股波动大 vs 制造业波动小)"
+        - "ATR 水平差异: 高 ATR 股票适合较长通道, 低 ATR 适合较短通道"
+
+    - title: "参数选择心得"
+      points:
+        - "入场周期过短 → 假突破频繁, 交易成本侵蚀收益"
+        - "入场周期过长 → 信号滞后, 错过趋势启动点"
+        - "出场周期一般取入场周期的 1/2, 平衡'及时离场'和'避免噪声'"
+        - "经典海龟参数 (20/10) 是经验最优, 适合大多数趋势型股票"
+        - "建议: 高波动股票用长周期 (30/15), 低波动用短周期 (15/7)"
+        - "ATR 止损倍数: 2×ATR 较激进 (止损快但可能误杀), 3×ATR 较保守"
+
+    - title: "不同时间窗口的表现差异分析"
+      points:
+        - "牛市阶段: 趋势明确, 突破信号有效, 策略大概率跑赢或接近买入持有"
+        - "熊市阶段: 突破信号帮助规避下跌, 策略可能大幅跑赢买入持有"
+        - "震荡阶段: 频繁假突破, 反复止损, 策略可能跑输买入持有"
+        - "时间窗口选择应覆盖不同市场环境, 避免仅在单一行情下评估"
+
+    - title: "海龟法则 vs 买入持有对比分析"
+      points:
+        - "趋势明确时: 海龟策略可规避大幅回撤, 超额收益显著"
+        - "单边上涨时: 买入持有可能更优 (海龟会错过部分涨幅)"
+        - "震荡市中: 海龟策略可能反复止损, 不如买入持有"
+        - "风险控制: 海龟策略最大回撤通常小于买入持有 (空仓期规避下跌)"
+        - "交易成本: 海龟交易次数少于双均线, 成本侵蚀相对较小"
+
+    - title: "海龟法则 vs 双均线策略对比 (跨策略)"
+      points:
+        - "信号机制: 海龟用价格突破通道, 双均线用均线交叉"
+        - "交易频率: 海龟通常低于双均线 (通道突破比均线交叉更稀疏)"
+        - "胜率: 海龟胜率通常略低于双均线, 但盈亏比更高"
+        - "持仓周期: 海龟平均持仓天数通常更长"
+        - "适用性: 两者都是趋势策略, 在震荡市中都会失效"
+
+    - title: "策略局限与改进方向"
+      points:
+        - "单一突破信号局限性大, 容易在震荡市亏损"
+        - "可加入成交量确认: 突破时成交量放大更可靠"
+        - "可加入 ATR 仓位管理: 高波动时减仓, 低波动时加仓"
+        - "可加入多时间框架确认: 日线突破+周线趋势一致时入场"
+        - "可尝试金字塔加仓: 突破后分批建仓, 趋势延续时加仓"
+        - "交易成本(手续费万三+滑点万一)对中频策略影响可控, 但需关注"
+        - "与买入持有对比: 若策略无法跑赢买入持有, 说明突破判断未带来正增益"
+
+# -------------------- 12. 文件输出规范 --------------------
+output_files:
+  strategy_script:
+    name: "turtle_strategy.py"
+    description: "主策略脚本, 包含数据加载、通道计算、ATR计算、信号生成、回测、可视化"
+    functions:
+      - load_and_clean(stock_name): "加载并清洗股票数据"
+      - calc_donchian(df, entry_period, exit_period): "计算唐奇安通道 (上轨/下轨/中轨)"
+      - calc_atr(df, period): "计算 True Range 和 ATR"
+      - gen_signals(df, use_stop_loss, atr_multiplier): "生成买卖信号 (含可选ATR止损)"
+      - select_window(df, time_window, warmup_period): "按时间窗口截取回测数据 (含预热期)"
+      - backtest(df, initial_capital): "执行回测, 返回净值和交易记录"
+      - backtest_benchmark(df, initial_capital): "执行买入持有回测, 返回净值"
+      - calc_metrics(backtest_result, benchmark_result): "计算海龟与基准的量化指标"
+      - plot_dashboard(df, metrics, stock_name, params): "绘制可视化看板 (HTML+ECharts)"
+      - run_experiment(stock_name, param_list, window_list): "参数+时间窗口实验"
+      - plot_experiment_results(results_df): "绘制参数实验对比图"
+
+  dashboard:
+    pattern: "{short_name}_turtle_dashboard.html"
+    examples:
+      - "CATL_turtle_dashboard.html"
+      - "SMIC_turtle_dashboard.html"
+
+  results_csv:
+    pattern: "{short_name}_turtle_results.csv"
+    description: "回测指标明细表"
+
+  experiment_csv:
+    name: "turtle_experiment_results.csv"
+    description: "参数实验汇总对比表"
+
+  report_pdf:
+    name: "郭美杰+TASK3.pdf"
+    description: "最终作业报告 (策略原理+回测结果+图表+总结心得)"
+
+# -------------------- 13. 技术栈 --------------------
+tech_stack:
+  language: "Python 3.12+"
+  libraries:
+    pandas: "数据处理"
+    numpy: "数值计算"
+    matplotlib: "PDF报告静态图表"
+    echarts: "HTML交互式看板 (通过CDN引入)"
+  data_source: "已存储的本地CSV文件 (无需联网获取)"
+  font: "宋体五号, 1.5倍行距 (PDF报告)"
+
+# -------------------- 14. 复现步骤 (SOP) --------------------
+reproduction_sop:
+  step_1:
+    name: "环境准备"
+    actions:
+      - "确认 Python 3.12+ 已安装"
+      - "pip install pandas numpy matplotlib"
+      - "确认数据文件在项目根目录: CATL_300750_daily_qfq.csv, SMIC_688981_daily_qfq.csv"
+
+  step_2:
+    name: "运行策略脚本"
+    actions:
+      - "python turtle_strategy.py"
+      - "脚本自动加载股票数据 (默认CATL)"
+      - "使用默认参数 (入场20日/出场10日/ATR20日) 执行回测"
+
+  step_3:
+    name: "查看输出"
+    actions:
+      - "终端打印回测指标摘要 (含买入持有对比)"
+      - "生成 HTML 看板: CATL_turtle_dashboard.html"
+      - "生成结果CSV: CATL_turtle_results.csv"
+
+  step_4:
+    name: "参数实验"
+    actions:
+      - "脚本自动运行6组参数 × 2支股票 = 12次回测"
+      - "生成对比表: turtle_experiment_results.csv"
+      - "生成参数实验对比柱状图"
+
+  step_5:
+    name: "生成报告"
+    actions:
+      - "运行 generate_turtle_report.py 生成PDF报告"
+      - "报告包含: 策略原理、通道与ATR图解、回测结果、可视化图表、参数对比、总结心得"
+
+  step_6:
+    name: "自定义扩展"
+    actions:
+      - "修改 turtle_strategy.py 中的 PARAM_GRID 添加更多参数组合"
+      - "修改 TIME_WINDOW 选择不同回测区间 (full/recent_3m/recent_6m/recent_12m/custom)"
+      - "开启 USE_STOP_LOSS = True 实验ATR止损效果"
+      - "替换数据文件以测试其他股票"
+      - "调整 BACKTEST_CONFIG 中的初始资金、佣金费率等参数"
